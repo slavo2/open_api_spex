@@ -193,7 +193,7 @@ defmodule OpenApiSpex.Schema do
          {:ok, result} <- cast(derived_schema, value, schemas) do
       {:ok, untag(schema, result)}
     else
-      {:error, :already_tagged} -> {:ok, %{}}
+      {:error, :already_tagged} -> cast(%{schema | discriminator: nil}, value, schemas)
       {:error, reason} -> {:error, reason}
     end
   end
@@ -241,7 +241,7 @@ defmodule OpenApiSpex.Schema do
     if schema.title in tags do
       {:error, :already_tagged}
     else
-      {:ok, %{value | tags: [schema.title | tags]}}
+      {:ok, %{value | __open_api_spex_tags: [schema.title | tags]}}
     end
   end
 
