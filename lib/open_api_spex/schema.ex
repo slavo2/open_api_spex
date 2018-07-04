@@ -132,15 +132,6 @@ defmodule OpenApiSpex.Schema do
       ...> dt |> DateTime.to_iso8601()
       "2018-04-02T13:44:55Z"
   """
-  @spec cast(Schema.t | Reference.t, any, %{String.t => Schema.t | Reference.t}) :: {:ok, any} | {:error, String.t}
-  def cast(schema = %Schema{"x-struct": mod}, value, schemas) when not is_nil(mod) do
-    with {:ok, data} <- cast(%{schema | "x-struct": nil}, value, schemas) do
-      case data do
-        %{__struct__: _} -> {:ok, data}
-        _ -> {:ok, struct(mod, data)}
-      end
-    end
-  end
   def cast(%Schema{type: :boolean}, value, _schemas) when is_boolean(value), do: {:ok, value}
   def cast(%Schema{type: :boolean}, value, _schemas) when is_binary(value) do
     case value do
@@ -188,19 +179,30 @@ defmodule OpenApiSpex.Schema do
     {:error, "Invalid array: #{inspect(value)}"}
   end
   def cast(schema = %Schema{type: :object, discriminator: discriminator = %{}}, value = %{}, schemas) do
-    with {:ok, value} <- tag(schema, value),
-         {:ok, derived_schema} <- Discriminator.resolve(discriminator, value, schemas),
-         {:ok, result} <- cast(derived_schema, value, schemas) do
-      {:ok, untag(schema, result)}
+    discriminator_property = String.to_existing_atom(discriminator.propertyName)
+    already_cast? =
+      if Map.has_key?(value, discriminator_property) do
+        {:error, :already_cast}
+      else
+        :ok
+      end
+
+    with :ok <- already_cast?,
+        {:ok, partial_cast} <- cast(%Schema{type: :object, properties: schema.properties}, value, schemas),
+        {:ok, derived_schema} <- Discriminator.resolve(discriminator, value, schemas),
+        {:ok, result} <- cast(derived_schema, partial_cast, schemas) do
+      {:ok, result}
     else
-      {:error, :already_tagged} -> cast(%{schema | discriminator: nil}, value, schemas)
+      {:error, :already_cast} -> {:ok, value}
       {:error, reason} -> {:error, reason}
     end
   end
-  def cast(%Schema{type: :object, allOf: [x | rest]}, value = %{}, schemas) do
-    with {:ok, cast_x} <- cast(x, value, schemas),
-         {:ok, cast_rest} <- cast(rest, value, schemas) do
-      Map.merge(cast_x, cast_rest)
+  def cast(schema = %Schema{type: :object, allOf: [first | rest]}, value = %{}, schemas) do
+    with {:ok, cast_first} <- cast(first, value, schemas),
+         {:ok, result} <- cast(%{schema | allOf: rest}, cast_first, schemas) do
+      {:ok, result}
+    else
+      {:error, reason} -> {:error, reason}
     end
   end
   def cast(schema = %Schema{type: :object, allOf: []}, value = %{}, schemas) do
@@ -208,9 +210,10 @@ defmodule OpenApiSpex.Schema do
   end
   def cast(schema = %Schema{type: :object}, value, schemas) when is_map(value) do
     schema = %{schema | properties: schema.properties || %{}}
-    regular_properties = Enum.filter(value, fn {k, _v} -> is_binary(k) end)
+    {regular_properties, others} = Enum.split_with(value, fn {k, _v} -> is_binary(k) end)
     with {:ok, props} <- cast_properties(schema, regular_properties, schemas) do
-      {:ok, Map.new(props)}
+      result = Map.new(others ++ props) |> make_struct(schema)
+      {:ok, result}
     end
   end
   def cast(ref = %Reference{}, val, schemas), do: cast(Reference.resolve_schema(ref, schemas), val, schemas)
@@ -218,6 +221,14 @@ defmodule OpenApiSpex.Schema do
     {:error, "Unexpected field with value #{inspect(val)}"}
   end
   def cast(_additionalProperties, val, _schemas), do: {:ok, val}
+
+  defp make_struct(val = %_{}, _), do: val
+  defp make_struct(val, %{"x-struct": nil}), do: val
+  defp make_struct(val, %{"x-struct": mod}) do
+    Enum.reduce(val, struct(mod), fn {k, v}, acc ->
+      Map.put(acc, k, v)
+    end)
+  end
 
   @spec cast_properties(Schema.t, list, %{String.t => Schema.t}) :: {:ok, list} | {:error, String.t}
   defp cast_properties(%Schema{}, [], _schemas), do: {:ok, []}
@@ -232,30 +243,6 @@ defmodule OpenApiSpex.Schema do
       {:ok, [{name, new_value} | cast_tail]}
     end
   end
-
-  # Record that a schema has already been used for casting/validation on a value
-  @spec tag(Schema.t, map) :: {:ok, map} | {:error, :already_tagged}
-  defp tag(schema, value) do
-    value = Map.put_new(value, :__open_api_spex_tags, [])
-    tags = value.__open_api_spex_tags
-    if schema.title in tags do
-      {:error, :already_tagged}
-    else
-      {:ok, %{value | __open_api_spex_tags: [schema.title | tags]}}
-    end
-  end
-
-  # Remove previously recorded tag
-  @spec untag(Schema.t, map) :: map
-  defp untag(schema, value) do
-    tags = value.__open_api_spex_tags -- [schema.title]
-    if Enum.empty?(tags) do
-      Map.delete(value, :__open_api_spex_tags)
-    else
-      Map.put(value, :__open_api_spex_tags, tags)
-    end
-  end
-
 
   @doc """
   Validate a value against a Schema.
@@ -450,4 +437,21 @@ defmodule OpenApiSpex.Schema do
   defp validate_object_property(schema, _required, value, path, schemas) do
     validate(schema, value, path, schemas)
   end
+
+  @doc """
+  Get the names of all properties definied for a schema.
+
+  Includes all properties directly defined in the schema, and all schemas
+  included in the `allOf` list.
+  """
+  def properties(schema = %Schema{type: :object, properties: properties = %{}}) do
+    Map.keys(properties) ++ properties(%{schema | properties: nil})
+  end
+  def properties(%Schema{allOf: schemas}) when is_list(schemas) do
+    Enum.flat_map(schemas, &properties/1) |> Enum.uniq()
+  end
+  def properties(schema_module) when is_atom(schema_module) do
+    properties(schema_module.schema())
+  end
+  def properties(_), do: []
 end
