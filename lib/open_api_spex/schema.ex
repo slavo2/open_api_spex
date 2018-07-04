@@ -191,7 +191,7 @@ defmodule OpenApiSpex.Schema do
         {:ok, partial_cast} <- cast(%Schema{type: :object, properties: schema.properties}, value, schemas),
         {:ok, derived_schema} <- Discriminator.resolve(discriminator, value, schemas),
         {:ok, result} <- cast(derived_schema, partial_cast, schemas) do
-      {:ok, result}
+      {:ok, make_struct(result, schema)}
     else
       {:error, :already_cast} -> {:ok, value}
       {:error, reason} -> {:error, reason}
